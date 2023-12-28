@@ -1,0 +1,76 @@
+#!/bin/bash
+
+# Function to print a message with red background
+print_red_bg() {
+  echo -e "\e[41;97m$1\e[0m"
+}
+
+# Function to print a message with green background
+print_green_bg() {
+  echo -e "\e[42;97m$1\e[0m"
+}
+
+# Print a border to make the initial message stand out
+echo "**********************************************"
+echo "**                                          **"
+echo "**   Before running this script, please     **"
+echo "**   ensure that the output of 'show        **"
+echo "**   configuration' in clish completes      **"
+echo "**   successfully. If the output ends with  **"
+echo "**   the lines:                             **"
+echo "**                                          **"
+echo "**   /pfrm2.0/bin/cli/showConfig.lua: in    **"
+echo "**   main chunk                             **"
+echo "**   /pfrm2.0/bin/cli/showConfig.lua: in    **"
+echo "**   main chunk                             **"
+echo "**                                          **"
+echo "**   Please make sure to upgrade to the     **"
+echo "**   latest GA take to avoid issues.        **"
+echo "**                                          **"
+echo "**   This script defaults the admin account **"
+echo "**   to expert mode. For more details on    **"
+echo "**   enabling this, please see SK111844.    **"
+echo "**                                          **"
+echo "**********************************************"
+
+# Prompt the user to continue after confirming the 'show configuration' output is successful
+read -p "Press Enter to continue."
+
+# Run the initial command and save the output to a file
+echo "Capturing initial configuration. This may take some time..."
+clish -c 'show configuration' > /storage/initial_config.txt
+echo "Initial configuration saved to /storage/initial_config.txt"
+
+# Extract and store the username from the initial configuration
+initial_username=$(grep 'add administrator username' /storage/initial_config.txt | awk '{print $5}')
+
+# Prompt the user to make changes via the UI
+read -p "Make the desired changes in the UI. Press Enter when ready."
+
+# Run the command again and save the output to a new file
+echo "Capturing modified configuration. This may take some time..."
+clish -c 'show configuration' > /storage/modified_config.txt
+echo "Modified configuration saved to /storage/modified_config.txt"
+
+# Extract and store the username from the modified configuration
+modified_username=$(grep 'add administrator username' /storage/modified_config.txt | awk '{print $5}')
+
+# Use ANSI escape codes for colored background output
+diff_result=$(diff --unified=1 /storage/initial_config.txt /storage/modified_config.txt | awk '
+  /^\+/{printf "\033[42;97m%s\033[0m\n", $0}
+  /^\-/{printf "\033[41;97m%s\033[0m\n", $0}
+  !/^[+-]/{print}
+')
+
+# Compare the two files
+if [ -z "$diff_result" ]; then
+  print_green_bg "No changes detected."
+else
+  echo "Changes detected. Diff:"
+  echo "$diff_result"
+fi
+
+# Delete the temporary files
+rm /storage/initial_config.txt /storage/modified_config.txt
+echo "Temporary files deleted."
+echo "Script output has been copied."
