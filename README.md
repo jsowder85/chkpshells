@@ -11,3 +11,8 @@ All Scripts in this repository are:
 The goal is to provide a CLI script that will capture changes made in clish configuration after you update settings from the UI.
 It will collect the existing configuration, prompt you to make the changes in the webUI, and then  diff the two configs and show you the output.
 The primary intended purpose right now is to help customers/partners in scripting zero-touch configurations for their customers in a more friendly and automated way.
+
+
+**SASEAttach**
+Meant to automate the process of connecting a locally managed spark appliance running R82.00.10 to one or multiple SASE gateways. Will setup full route based VPN configuration
+as recommended by Check Point admin guides instead of doing a simpler domain based approach.
