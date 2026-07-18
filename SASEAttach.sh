@@ -11,12 +11,13 @@
 #   0. How many SASE gateways to build tunnels to (1-50)
 #   Collected ONCE, shared across ALL tunnels:
 #     1. Local BGP AS number (defaults to 65000 if left blank)
-#     2. SASE BGP AS number (defaults to 64515 if left blank; shared by all SASE peers)
+#     2. SASE BGP AS number (defaults to 64512 if left blank, per Check Point's
+#        SASE Admin Guide; shared by all SASE peers)
 #     3. Public IP of the locally managed Spark gateway (local)          -> ike-v2-gateway-id-override
 #   Collected for EACH SASE gateway:
 #     4. Public IP of that SASE gateway (remote peer)                    -> remote-site-ip-address / ike-v2-peer-id
 #     5. Pre-Shared Secret Key (can differ per gateway)                  -> auth password
-#     6. VTI remote IP (the peer's tunnel interface address)             -> vpn tunnel "remote"
+#     6. VTI remote IP (Check Point SASE Gateway Internal IP)               -> vpn tunnel "remote"
 #     7. Local VTI IP address for this tunnel (a sensible default is     -> vpn tunnel "local" / interface address
 #        suggested based on the remote VTI IP, but can be overridden)
 #
@@ -40,6 +41,42 @@
 # written to the log in plaintext.
 #
 # Everything else in the commands is left exactly as provided.
+#
+# ---------------------------------------------------------------------------
+# REVISION LOG
+# Only major/functional changes are documented here going forward. Small
+# regression fixes, wording tweaks, and minor test corrections are tracked
+# as dot releases without a full entry.
+#
+#   1.0 - Initial release. Route-based site-to-site VPN with numbered VTIs
+#         and BGP, --revert rollback support, dynamic-routing detection,
+#         host-object-restricted BGP access rule, and selectable route
+#         advertisement (all interfaces, specific interfaces, or manual
+#         CIDR networks).
+#   1.1 - Corrected the default SASE BGP AS number to 64512 (previously
+#         64515), matching Check Point's official SASE Admin Guide. The
+#         route advertisement interface list now also excludes any
+#         interface backing an Internet/WAN connection, so a WAN uplink
+#         can never accidentally be redistributed to the SASE gateway(s).
+#   1.2 - Reworked the post-run health check into a live, auto-refreshing
+#         dashboard: "vpn tu tlist" and "show bgp peers" now run in the
+#         background every 30 seconds, showing a simple color-coded
+#         UP/DOWN status per tunnel and per BGP peer instead of raw
+#         command output. Monitoring stops automatically once everything
+#         is green (printing the full raw output once as confirmation),
+#         and if 5 minutes pass without that happening, the user is asked
+#         whether to keep monitoring. Persistent storage (log file and
+#         rollback manifest) now defaults to /storage/sase_vpn, the
+#         partition that survives a reboot on Spark appliances.
+#   1.3 - Health check dashboard now refreshes every 10 seconds (was 30).
+#         Added a new "--healthcheck [manifest]" flag to run just the live
+#         dashboard on its own, without repeating the creation flow -
+#         loads the same rollback manifest used by --revert to know which
+#         tunnels/peers to check (the manifest now also records each SASE
+#         gateway's public IP for this purpose). The rollback command
+#         reminder is now also reprinted immediately after execution
+#         completes, not just before, so it's harder to miss/scroll past.
+# ---------------------------------------------------------------------------
 
 set -euo pipefail
 
@@ -61,13 +98,22 @@ fi
 # Set up the persistent log file FIRST, before any prompts run, so that
 # even a failure during input collection (or an unexpected bug) leaves a
 # diagnostic trail rather than nothing at all.
+#
+# /storage is the partition that survives a reboot on Spark appliances, so
+# it's used as the primary location - this matters not just for the log,
+# but for the rollback manifest written alongside it, since --revert needs
+# to be able to find that manifest even after the box has been rebooted.
+# /var/log and /var/tmp are only used as a fallback if /storage is somehow
+# unavailable, and are NOT guaranteed to survive a reboot.
 # ---------------------------------------------------------------------------
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-LOG_CANDIDATES=("/var/log/sase_vpn" "/storage/sase_vpn" "/var/tmp/sase_vpn")
+LOG_CANDIDATES=("/storage/sase_vpn" "/var/log/sase_vpn" "/var/tmp/sase_vpn")
 LOG_DIR=""
+LOG_DIR_IS_PERSISTENT=false
 for candidate in "${LOG_CANDIDATES[@]}"; do
     if mkdir -p "$candidate" 2>/dev/null; then
         LOG_DIR="$candidate"
+        [[ "$candidate" == "/storage/sase_vpn" ]] && LOG_DIR_IS_PERSISTENT=true
         break
     fi
 done
@@ -77,6 +123,13 @@ if [[ -z "$LOG_DIR" ]]; then
 fi
 LOG_FILE="${LOG_DIR}/sase_vpn_${TIMESTAMP}.log"
 : > "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/sase_vpn_${TIMESTAMP}.log"
+
+if [[ "$LOG_DIR_IS_PERSISTENT" != true ]]; then
+    echo -e "${C_YELLOW}Warning: /storage/sase_vpn was not available - using ${LOG_DIR} instead,"
+    echo -e "which may not survive a reboot. The rollback manifest for this run may not"
+    echo -e "be found later by --revert if this appliance is rebooted before then.${C_RESET}"
+    echo
+fi
 
 # Appends a timestamped line to the log file. Safe to call before PSKS
 # exists (sanitize_for_log only runs on command strings, not here).
@@ -126,12 +179,12 @@ fi
 run_group() {
     trap - ERR
     local start="$1" end="$2" outfile="$3"
-    local j cmd output status encoded attempt
+    local j cmd output status encoded attempt src_name fallback_cmd fb_output fb_status
     : > "$outfile"
     for ((j = start; j <= end; j++)); do
         cmd="${COMMANDS[$j]}"
 
-        for attempt in 1 2 3; do
+        for attempt in 1 2 3 4 5; do
             if output="$(timeout "${CLISH_TIMEOUT}" clish -c "${cmd}" 2>&1)"; then
                 status=0
             else
@@ -144,24 +197,43 @@ run_group() {
             # A dependency this command relies on (e.g. a bgp-policy, BGP
             # peer, VTI tunnel, or VPN site just created by a previous
             # command) may not be immediately visible yet on some systems.
-            # If we see this class of error, pause briefly and retry (up to
-            # 3 attempts total) before giving up.
-            if [[ "$attempt" -lt 3 ]] && [[ "$output" == *"There is no"*"with id"* || "$output" == *"does not exist"* || "$output" == *"not configured"* ]]; then
-                sleep 2
+            # If we see this class of error, pause and retry (up to 5
+            # attempts total, 10 seconds apart) before giving up.
+            if [[ "$attempt" -lt 5 ]] && [[ "$output" == *"There is no"*"with id"* || "$output" == *"does not exist"* || "$output" == *"not configured"* ]]; then
+                log_msg "Retry ${attempt}/5 for dependency-not-ready error on: ${cmd} - waiting 10s. Output: ${output}"
+                sleep 10
                 continue
             fi
             break
         done
 
+        # The BGP access rule may already exist even though our earlier
+        # detection missed it (e.g. a concurrent run, or a naming/formatting
+        # variant our check didn't match). Rather than fail outright, fall
+        # back to adding this gateway's host object as a source on the
+        # existing rule instead - the practical goal either way.
+        if [[ "$cmd" == *"add access-rule"*"SASE_BGP_ALLOW"* ]] && [[ "$output" == *"already exists"* ]] && [[ "$cmd" =~ source\ \"([^\"]+)\" ]]; then
+            src_name="${BASH_REMATCH[1]}"
+            fallback_cmd="set access-rule type incoming-internal-and-vpn name \"SASE_BGP_ALLOW\" add source \"${src_name}\""
+            if fb_output="$(timeout "${CLISH_TIMEOUT}" clish -c "${fallback_cmd}" 2>&1)"; then
+                fb_status=0
+            else
+                fb_status=$?
+            fi
+            output="[INFO] Access rule \"SASE_BGP_ALLOW\" already exists - added ${src_name} as a source instead.${fb_output:+ ${fb_output}}"
+            status=$fb_status
+        fi
+
         encoded="${output//$'\n'/\\n}"
         printf '%s\t%s\n' "$status" "$encoded" >> "$outfile"
 
         # After creating an inbound-route-filter bgp-policy, give it a flat
-        # 15-second settle window before the next command (which configures
-        # it further) runs.
+        # 30-second settle window before the next command (which configures
+        # it further) runs. This step has repeatedly needed longer than
+        # expected to register on some appliances.
         case "$cmd" in
             *"based-on-as as "*" on")
-                sleep 15
+                sleep 30
                 ;;
         esac
 
@@ -191,6 +263,7 @@ SPINNER_CHARS='|/-\'
 execute_command_groups() {
     TOTAL=${#COMMANDS[@]}
     FAIL_COUNT=0
+    GROUP_FAIL_COUNT=0
 
     GROUP_TITLES=()
     GROUP_STARTS=()
@@ -254,7 +327,9 @@ execute_command_groups() {
                 echo "----------------------------------------------------------------"
             } >> "$LOG_FILE"
 
-            if [[ -n "$output" ]] && [[ "$output" == *"Could not"* || "$output" == *"Error"* || "$output" == *"error"* || "$r_status" -ne 0 ]]; then
+            if [[ "$output" == "[INFO]"* ]]; then
+                echo -e "        ${C_CYAN}${output}${C_RESET}"
+            elif [[ -n "$output" ]] && [[ "$output" == *"Could not"* || "$output" == *"Error"* || "$output" == *"error"* || "$r_status" -ne 0 ]]; then
                 group_fail=$((group_fail + 1))
                 FAIL_COUNT=$((FAIL_COUNT + 1))
                 echo -e "        ${C_RED}[FAIL] ${desc}${C_RESET}"
@@ -267,15 +342,16 @@ execute_command_groups() {
         if [ "$group_fail" -eq 0 ]; then
             echo -e "        ${C_GREEN}[OK] done${C_RESET}"
         else
+            GROUP_FAIL_COUNT=$((GROUP_FAIL_COUNT + 1))
             echo -e "        ${C_YELLOW}[WARN] completed with ${group_fail} issue(s) - see above${C_RESET}"
         fi
     done
 
     echo
     if [[ "$FAIL_COUNT" -eq 0 ]]; then
-        echo -e "${C_GREEN}${C_BOLD}=== Operation complete (${TOTAL}/${TOTAL} steps succeeded) ===${C_RESET}"
+        echo -e "${C_GREEN}${C_BOLD}=== Operation complete (${NUM_GROUPS}/${NUM_GROUPS} steps succeeded) ===${C_RESET}"
     else
-        echo -e "${C_YELLOW}${C_BOLD}=== Operation finished with ${FAIL_COUNT} issue(s) out of ${TOTAL} steps ===${C_RESET}"
+        echo -e "${C_YELLOW}${C_BOLD}=== Operation finished with ${GROUP_FAIL_COUNT} issue(s) out of ${NUM_GROUPS} steps ===${C_RESET}"
     fi
 
     {
@@ -284,6 +360,208 @@ execute_command_groups() {
     } >> "$LOG_FILE"
 
     echo -e "${C_BOLD}Full command output has been saved to:${C_RESET} ${LOG_FILE}"
+}
+
+# ---------------------------------------------------------------------------
+# Live, auto-refreshing health check dashboard. Uses the global GW_COUNT,
+# SITE_NAMES, SASE_GW_IPS, and VTI_REMOTE_IPS arrays to know which tunnels
+# and BGP peers to check - these are populated either by a fresh creation
+# run, or (for --healthcheck) loaded from a rollback manifest. Requires
+# LOG_FILE to already be set up.
+#
+# "vpn tu tlist" and "show bgp peers" are re-run in the background every 10
+# seconds, and a simple per-tunnel / per-peer status line is redrawn from
+# their output - rather than dumping the raw command output every cycle.
+# Press Ctrl+C to stop at any time.
+#
+# If every tunnel and peer goes green, monitoring stops automatically and
+# the full raw output of both commands is shown once as final confirmation.
+# If 5 minutes pass without everything being healthy, the user is asked
+# whether to keep monitoring, since everything should normally be up by then.
+# ---------------------------------------------------------------------------
+run_health_check_dashboard() {
+    # sed doesn't interpret "\033"-style escapes the way echo -e/printf do,
+    # so real ESC bytes are generated here first, then used directly
+    # wherever a color needs to be embedded into text coming from clish
+    # output (this also naturally no-ops when colors are disabled, since
+    # C_GREEN/C_YELLOW/C_RESET are empty strings in that case).
+    local REAL_GREEN REAL_YELLOW REAL_RESET
+    REAL_GREEN="$(printf '%b' "${C_GREEN}")"
+    REAL_YELLOW="$(printf '%b' "${C_YELLOW}")"
+    REAL_RESET="$(printf '%b' "${C_RESET}")"
+
+    local HEALTHCHECK_STOPPED=false
+    local HEALTHCHECK_ALL_GREEN=false
+    local HEALTHCHECK_START_TIME
+    HEALTHCHECK_START_TIME=$(date +%s)
+    trap 'HEALTHCHECK_STOPPED=true' SIGINT
+
+    local TU_TMPFILE BGP_TMPFILE TU_BGPID BGP_BGPID si ch
+    local VPN_TU_OUTPUT BGP_PEERS_OUTPUT
+    local ALL_TUNNELS_UP ALL_PEERS_UP i site gw_ip remote_vti peer_state
+    local HEALTHCHECK_ELAPSED HEALTHCHECK_CONTINUE s
+
+    while [[ "$HEALTHCHECK_STOPPED" != true ]]; do
+        # Gather both commands' output in the background so the dashboard
+        # can show a "collecting..." spinner rather than appearing to hang.
+        TU_TMPFILE="$(mktemp)"
+        BGP_TMPFILE="$(mktemp)"
+        ( clish -c "vpn tu tlist" > "$TU_TMPFILE" 2>&1 ) &
+        TU_BGPID=$!
+        ( clish -c "show bgp peers" > "$BGP_TMPFILE" 2>&1 ) &
+        BGP_BGPID=$!
+
+        si=0
+        while kill -0 "$TU_BGPID" 2>/dev/null || kill -0 "$BGP_BGPID" 2>/dev/null; do
+            [[ "$HEALTHCHECK_STOPPED" == true ]] && break
+            ch="${SPINNER_CHARS:$si:1}"
+            printf "\r%s Collecting current status..." "$ch"
+            si=$(( (si + 1) % ${#SPINNER_CHARS} ))
+            sleep 0.2
+        done
+        wait "$TU_BGPID" 2>/dev/null || true
+        wait "$BGP_BGPID" 2>/dev/null || true
+        printf "\r\033[K"
+
+        VPN_TU_OUTPUT="$(cat "$TU_TMPFILE" 2>/dev/null)"
+        BGP_PEERS_OUTPUT="$(cat "$BGP_TMPFILE" 2>/dev/null)"
+        rm -f "$TU_TMPFILE" "$BGP_TMPFILE"
+
+        log_msg "Health check cycle: refreshed vpn tu tlist / show bgp peers status."
+
+        echo
+        echo -e "${C_BOLD}$(printf '=%.0s' $(seq 1 60))${C_RESET}"
+        echo -e "${C_BOLD}=== SASE Configuration Health Check ===${C_RESET}"
+        echo "Last updated: $(date '+%Y-%m-%d %H:%M:%S')  (refreshes every 10s - Ctrl+C to stop)"
+        echo
+
+        ALL_TUNNELS_UP=true
+        echo -e "${C_BOLD}--- VPN Tunnel Status ---${C_RESET}"
+        for ((i = 0; i < GW_COUNT; i++)); do
+            site="${SITE_NAMES[$i]}"
+            gw_ip="${SASE_GW_IPS[$i]}"
+            if tunnel_is_up "$VPN_TU_OUTPUT" "$gw_ip"; then
+                printf "  %-12s (%s): %sUP%s\n" "$site" "$gw_ip" "$REAL_GREEN" "$REAL_RESET"
+            else
+                printf "  %-12s (%s): %sDOWN%s\n" "$site" "$gw_ip" "$REAL_YELLOW" "$REAL_RESET"
+                ALL_TUNNELS_UP=false
+            fi
+        done
+
+        echo
+        ALL_PEERS_UP=true
+        echo -e "${C_BOLD}--- BGP Peer Status ---${C_RESET}"
+        for ((i = 0; i < GW_COUNT; i++)); do
+            site="${SITE_NAMES[$i]}"
+            remote_vti="${VTI_REMOTE_IPS[$i]}"
+            peer_state="$(bgp_peer_state "$BGP_PEERS_OUTPUT" "$remote_vti")"
+            if [[ "$peer_state" == "Established" ]]; then
+                printf "  %-12s (peer %s): %sEstablished%s\n" "$site" "$remote_vti" "$REAL_GREEN" "$REAL_RESET"
+            elif [[ -n "$peer_state" ]]; then
+                printf "  %-12s (peer %s): %s%s%s\n" "$site" "$remote_vti" "$REAL_YELLOW" "$peer_state" "$REAL_RESET"
+                ALL_PEERS_UP=false
+            else
+                printf "  %-12s (peer %s): %snot visible yet%s\n" "$site" "$remote_vti" "$REAL_YELLOW" "$REAL_RESET"
+                ALL_PEERS_UP=false
+            fi
+        done
+
+        echo
+        echo -e "${C_BOLD}Full command output is being appended to:${C_RESET} ${LOG_FILE}"
+        {
+            echo "--- Health check cycle $(date '+%Y-%m-%d %H:%M:%S') ---"
+            echo "$VPN_TU_OUTPUT"
+            echo "$BGP_PEERS_OUTPUT"
+            echo "---------------------------------------------"
+        } >> "$LOG_FILE"
+
+        if [[ "$HEALTHCHECK_STOPPED" == true ]]; then
+            break
+        fi
+
+        # Everything is healthy - stop monitoring, show the full raw
+        # command output once as final confirmation, and end.
+        if [[ "$ALL_TUNNELS_UP" == true && "$ALL_PEERS_UP" == true ]]; then
+            HEALTHCHECK_ALL_GREEN=true
+            log_msg "Health check: all tunnels UP and all BGP peers Established - stopping monitoring."
+            break
+        fi
+
+        # If 5 minutes have passed without everything being healthy yet,
+        # pause and ask whether to keep monitoring - by this point
+        # everything should normally have come up already.
+        HEALTHCHECK_ELAPSED=$(( $(date +%s) - HEALTHCHECK_START_TIME ))
+        if [ "$HEALTHCHECK_ELAPSED" -ge 300 ]; then
+            echo
+            echo -e "${C_YELLOW}This health check has been running for 5 minutes and not everything is"
+            echo -e "healthy yet. Tunnels and BGP peering should normally be up well before now.${C_RESET}"
+            echo
+            read -rp "Continue monitoring? (y/N): " HEALTHCHECK_CONTINUE
+            if [[ ! "$HEALTHCHECK_CONTINUE" =~ ^[Yy]$ ]]; then
+                log_msg "User stopped health check after 5-minute checkpoint (not all healthy)."
+                break
+            fi
+            log_msg "User chose to continue health check monitoring past the 5-minute checkpoint."
+            HEALTHCHECK_START_TIME=$(date +%s)
+        fi
+
+        for ((s = 10; s > 0; s--)); do
+            [[ "$HEALTHCHECK_STOPPED" == true ]] && break
+            printf "\rNext refresh in %2ds (Ctrl+C to stop)..." "$s"
+            sleep 1
+        done
+        echo
+    done
+
+    echo
+
+    if [[ "$HEALTHCHECK_ALL_GREEN" == true ]]; then
+        echo -e "${C_GREEN}${C_BOLD}All tunnels are up and all BGP peers are Established.${C_RESET}"
+        echo
+        echo -e "${C_BOLD}--- vpn tu tlist (full output) ---${C_RESET}"
+        echo "$VPN_TU_OUTPUT"
+        echo
+        echo -e "${C_BOLD}--- show bgp peers (full output) ---${C_RESET}"
+        echo "$BGP_PEERS_OUTPUT"
+        echo
+        log_msg "Health check finished: all green, full command output displayed."
+    else
+        echo "Health check stopped."
+        log_msg "Health check dashboard stopped by user (Ctrl+C)."
+    fi
+}
+
+# Returns 0 (true) if the given peer IP's block in "vpn tu tlist" output
+# contains a real "Out SPI:" field. Per observed appliance behavior, a down
+# tunnel either omits this field entirely or shows "No outbound SPI"
+# instead - neither of which contains the literal substring "Out SPI:".
+tunnel_is_up() {
+    local tu_output="$1" peer_ip="$2"
+    local -a lines
+    mapfile -t lines <<< "$tu_output"
+    local -a border_idxs=()
+    local i
+    for i in "${!lines[@]}"; do
+        [[ "${lines[$i]}" =~ ^[+-]+[[:space:]]*$ ]] && border_idxs+=("$i")
+    done
+    [ "${#border_idxs[@]}" -lt 2 ] && return 1
+    local k start end block_text
+    for ((k = 0; k < ${#border_idxs[@]} - 1; k++)); do
+        start="${border_idxs[$k]}"
+        end="${border_idxs[$((k + 1))]}"
+        block_text="$(printf '%s\n' "${lines[@]:$start:$((end - start + 1))}")"
+        if [[ "$block_text" == *"$peer_ip"* ]]; then
+            [[ "$block_text" == *"Out SPI:"* ]] && return 0 || return 1
+        fi
+    done
+    return 1
+}
+
+# Prints the BGP State field for the given peer IP from "show bgp peers"
+# output, or empty if that peer isn't listed at all yet.
+bgp_peer_state() {
+    local bgp_output="$1" peer_ip="$2"
+    echo "$bgp_output" | awk -v ip="$peer_ip" '$1 == ip { print $5 }' | head -n1
 }
 
 log_msg "=== Run started ==="
@@ -349,7 +627,7 @@ if [[ "${1:-}" == "--revert" ]]; then
     REVERT_MANIFEST="${2:-}"
 
     if [[ -z "$REVERT_MANIFEST" ]]; then
-        REVERT_MANIFEST="$(ls -t /var/log/sase_vpn/sase_vpn_manifest_*.conf /storage/sase_vpn/sase_vpn_manifest_*.conf /var/tmp/sase_vpn/sase_vpn_manifest_*.conf 2>/dev/null | head -n1 || true)"
+        REVERT_MANIFEST="$(ls -t /storage/sase_vpn/sase_vpn_manifest_*.conf /var/log/sase_vpn/sase_vpn_manifest_*.conf /var/tmp/sase_vpn/sase_vpn_manifest_*.conf 2>/dev/null | head -n1 || true)"
     fi
 
     if [[ -z "$REVERT_MANIFEST" || ! -f "$REVERT_MANIFEST" ]]; then
@@ -552,6 +830,62 @@ if [[ "${1:-}" == "--revert" ]]; then
     exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# --healthcheck [manifest_file]
+#
+# Runs only the live health check dashboard, without going through the
+# creation flow - useful for re-checking tunnel/BGP status later without
+# needing to reconfigure anything. Loads the same rollback manifest used by
+# --revert (most recent one found if no path is given) to know which
+# tunnels and BGP peers to check.
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "--healthcheck" ]]; then
+    HEALTHCHECK_MANIFEST="${2:-}"
+
+    if [[ -z "$HEALTHCHECK_MANIFEST" ]]; then
+        HEALTHCHECK_MANIFEST="$(ls -t /storage/sase_vpn/sase_vpn_manifest_*.conf /var/log/sase_vpn/sase_vpn_manifest_*.conf /var/tmp/sase_vpn/sase_vpn_manifest_*.conf 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [[ -z "$HEALTHCHECK_MANIFEST" || ! -f "$HEALTHCHECK_MANIFEST" ]]; then
+        echo -e "${C_RED}Error: no rollback manifest found. Specify one explicitly:${C_RESET}"
+        echo "  $0 --healthcheck /path/to/sase_vpn_manifest_TIMESTAMP.conf"
+        log_msg "FATAL: --healthcheck requested but no manifest file found (given: '${HEALTHCHECK_MANIFEST}')."
+        exit 1
+    fi
+
+    echo -e "${C_BOLD}=== SASE Configuration Health Check ===${C_RESET}"
+    echo "Using manifest: ${HEALTHCHECK_MANIFEST}"
+    log_msg "Standalone health check requested using manifest: ${HEALTHCHECK_MANIFEST}"
+    echo
+
+    # Manifest contains only plain KEY=value assignments written by this
+    # script itself - safe to source.
+    # shellcheck disable=SC1090
+    source "$HEALTHCHECK_MANIFEST"
+
+    IFS=',' read -ra SITE_NAMES <<< "${SITE_NAMES:-}"
+    IFS=',' read -ra SASE_GW_IPS <<< "${SASE_GW_IPS:-}"
+    IFS=',' read -ra VTI_REMOTE_IPS <<< "${VTI_REMOTE_IPS:-}"
+    GW_COUNT="${#SITE_NAMES[@]}"
+
+    if [ "$GW_COUNT" -eq 0 ] || [ "${#SASE_GW_IPS[@]}" -eq 0 ] || [ "${#VTI_REMOTE_IPS[@]}" -eq 0 ]; then
+        echo -e "${C_RED}Error: manifest file is missing required data (site names, SASE gateway IPs,"
+        echo -e "or VTI remote IPs). It may have been written by an older version of this script."
+        echo -e "Aborting.${C_RESET}"
+        log_msg "FATAL: manifest file '${HEALTHCHECK_MANIFEST}' is missing data required for --healthcheck."
+        exit 1
+    fi
+
+    echo "Monitoring the following tunnel(s):"
+    for ((i = 0; i < GW_COUNT; i++)); do
+        echo "  - ${SITE_NAMES[$i]}: gateway ${SASE_GW_IPS[$i]}, BGP peer ${VTI_REMOTE_IPS[$i]}"
+    done
+    echo
+
+    run_health_check_dashboard
+    exit 0
+fi
+
 echo -e "${C_BOLD}=== SASE Route-Based VPN + BGP Configuration ===${C_RESET}"
 echo
 
@@ -569,6 +903,59 @@ is_valid_ipv4() {
         [ "$o" -ge 0 ] && [ "$o" -le 255 ] || return 1
     done
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# Helpers: convert between dotted-decimal IPv4 and a 32-bit integer, used to
+# compute the network address of an interface from its IP + subnet mask.
+# ---------------------------------------------------------------------------
+ip_to_int() {
+    local a b c d
+    IFS='.' read -r a b c d <<< "$1"
+    echo $(( (a << 24) + (b << 16) + (c << 8) + d ))
+}
+
+int_to_ip() {
+    local ip_int=$1
+    echo "$(( (ip_int >> 24) & 255 )).$(( (ip_int >> 16) & 255 )).$(( (ip_int >> 8) & 255 )).$(( ip_int & 255 ))"
+}
+
+# Converts a dotted-decimal subnet mask (e.g. 255.255.255.0) to a CIDR
+# prefix length (e.g. 24), by counting the set bits in its integer form.
+mask_to_prefix() {
+    local mask_int prefix=0 bit
+    mask_int=$(ip_to_int "$1")
+    for ((bit = 31; bit >= 0; bit--)); do
+        (( (mask_int >> bit) & 1 )) || break
+        prefix=$((prefix + 1))
+    done
+    echo "$prefix"
+}
+
+# Converts a CIDR prefix length (e.g. 24) to a dotted-decimal subnet mask
+# (e.g. 255.255.255.0). Some interface types (e.g. VLAN sub-interfaces) are
+# configured with "mask-length" rather than "subnet-mask" in the running
+# configuration.
+prefix_to_mask() {
+    local prefix=$1
+    local mask_int=0
+    if [ "$prefix" -gt 0 ]; then
+        mask_int=$(( 0xFFFFFFFF << (32 - prefix) & 0xFFFFFFFF ))
+    fi
+    int_to_ip "$mask_int"
+}
+
+# Given an interface's IPv4 address and subnet mask, returns the network
+# it's on in CIDR form (e.g. 192.168.1.1 + 255.255.255.0 -> 192.168.1.0/24) -
+# this is what should actually be offered/advertised, not the host IP itself.
+network_from_ip_and_mask() {
+    local ip="$1" mask="$2"
+    local ip_int mask_int network_int prefix
+    ip_int=$(ip_to_int "$ip")
+    mask_int=$(ip_to_int "$mask")
+    network_int=$(( ip_int & mask_int ))
+    prefix=$(mask_to_prefix "$mask")
+    echo "$(int_to_ip "$network_int")/${prefix}"
 }
 
 # ---------------------------------------------------------------------------
@@ -638,6 +1025,7 @@ prompt_ipv4() {
 
         if [[ "$check_conflict" == true ]] && ip_in_use "$input"; then
             echo "  Error: \"${input}\" is already in use on this system (or was already entered for another tunnel above). Please enter a different IP."
+            show_ip_conflict_source "$input"
             continue
         fi
 
@@ -748,9 +1136,9 @@ if [[ -n "$EXISTING_LOCAL_AS" || -n "$EXISTING_REMOTE_AS_LIST" ]]; then
 
     if [[ -n "$EXISTING_LOCAL_AS" ]]; then
         while true; do
-            read -rp "Use the existing local BGP AS number shown above instead of entering a new one? [y/n]: " ROUTING_CHOICE
+            read -rp "Use the existing local BGP AS number shown above instead of entering a new one? [Y/n]: " ROUTING_CHOICE
             case "${ROUTING_CHOICE,,}" in
-                y|yes)
+                y|yes|"")
                     ROUTING_MODE="auto"
                     break
                     ;;
@@ -873,6 +1261,20 @@ ip_in_use() {
     done
     return 1
 }
+
+# Prints the actual show-configuration line(s) referencing the given IP, so
+# the user can identify exactly what still holds onto it (e.g. a leftover
+# "add vpn tunnel" object left behind by only partially removing a VTI by
+# hand) rather than just being told it's "in use" with no further detail.
+show_ip_conflict_source() {
+    local ip="$1"
+    local matches
+    matches="$(echo "${SHOW_CONFIG_OUTPUT}" | grep -F "\"${ip}\"" || true)"
+    if [[ -n "$matches" ]]; then
+        echo "  This IP appears in the current configuration here:"
+        echo "$matches" | sed 's/^/    /'
+    fi
+}
 echo
 
 # ---------------------------------------------------------------------------
@@ -905,9 +1307,9 @@ fi
 # ---------------------------------------------------------------------------
 while true; do
     while true; do
-        read -rp "Enter the SASE BGP AS number [default: 64515]: " SASE_AS_INPUT
+        read -rp "Enter the SASE BGP AS number [default: 64512]: " SASE_AS_INPUT
         if [[ -z "$SASE_AS_INPUT" ]]; then
-            SASE_AS=64515
+            SASE_AS=64512
             break
         fi
         if is_valid_asn "$SASE_AS_INPUT"; then
@@ -962,6 +1364,17 @@ for ((g = 1; g <= GW_COUNT; g++)); do
 
     while true; do
         prompt_ipv4 "  Enter the public IP address of this SASE gateway" SASE_GW_IP_INPUT false
+        DUPLICATE_GW_IP=false
+        for existing_gw_ip in "${SASE_GW_IPS[@]:-}"; do
+            if [[ -n "$existing_gw_ip" && "$existing_gw_ip" == "$SASE_GW_IP_INPUT" ]]; then
+                DUPLICATE_GW_IP=true
+                break
+            fi
+        done
+        if [[ "$DUPLICATE_GW_IP" == true ]]; then
+            echo "  Error: \"${SASE_GW_IP_INPUT}\" was already entered for another gateway above. Each SASE gateway must have a unique public IP - a duplicate here will cause failures later. Please enter a different IP."
+            continue
+        fi
         if confirm_if_private_ip "$SASE_GW_IP_INPUT" "a SASE gateway's public IP"; then
             break
         fi
@@ -996,7 +1409,7 @@ for ((g = 1; g <= GW_COUNT; g++)); do
         break
     done
 
-    prompt_ipv4 "  Enter the VTI remote IP (the SASE gateway's tunnel interface address)" VTI_REMOTE_INPUT true
+    prompt_ipv4 "  Enter the VTI remote IP (Check Point SASE Gateway Internal IP)" VTI_REMOTE_INPUT true
     VTI_REMOTE_IPS+=("$VTI_REMOTE_INPUT")
 
     SUGGESTED_LOCAL_VTI="$(suggest_local_vti "$VTI_REMOTE_INPUT")"
@@ -1035,28 +1448,105 @@ echo
 
 # ---------------------------------------------------------------------------
 # Which local interfaces/networks should be advertised (redistributed) to
-# the SASE gateway(s) over BGP - all interfaces (as before), one or more
-# specific interfaces, or one or more manually specified CIDR networks.
+# the SASE gateway(s) over BGP - all interfaces, one or more specific
+# interfaces, or one or more manually specified CIDR networks.
+#
+# "All interfaces" advertises exactly the interfaces listed above (each as
+# its own "from interface" redistribution entry) - never the excluded
+# WAN/Internet or VTI tunnel interfaces, and never a blanket "interface all"
+# that could sweep those back in. The blanket command is only used as a
+# last-resort fallback if no interfaces could be discovered at all.
+#
+# VLAN sub-interfaces (e.g. "DMZ.10" for VLAN 10 on interface DMZ) are
+# discovered the same way as physical interfaces, since Check Point Spark
+# configures their IP the same way ("set interface <name> ipv4-address ...")
+# - the only difference is VLANs may specify their mask via "mask-length"
+# (a prefix, e.g. 24) rather than "subnet-mask" (dotted-decimal), which is
+# handled below.
 # ---------------------------------------------------------------------------
 echo -e "${C_BOLD}--- Route Advertisement to SASE ---${C_RESET}"
 
 # Discover configured interfaces and their IPv4 addresses from the running
-# configuration, excluding VTI tunnel interfaces (vpnt*) since those are
-# point-to-point tunnel links, not LAN networks worth advertising.
+# configuration, excluding:
+#   - VTI tunnel interfaces (vpnt*), since those are point-to-point tunnel
+#     links, not LAN networks worth advertising
+#   - Any Internet/WAN connection, whether it shows up in "show configuration"
+#     under its own connection name (e.g. "Internet1") or under the physical
+#     interface name it's bound to (e.g. "WAN"), since advertising a WAN
+#     uplink to the SASE gateway would never be correct
+INTERNET_CONN_NAMES="$(echo "${SHOW_CONFIG_OUTPUT}" | sed -n 's/.*internet-connection name "\?\([^" ]*\)"\?.*/\1/p' | sort -u || true)"
+INTERNET_BOUND_IFACES="$(echo "${SHOW_CONFIG_OUTPUT}" | sed -n 's/.*internet-connection name "\?[^" ]*"\? interface "\?\([^" ]*\)"\?.*/\1/p' | sort -u || true)"
+INTERNET_IFACE_NAMES="$(printf '%s\n%s\n' "${INTERNET_CONN_NAMES}" "${INTERNET_BOUND_IFACES}" | sed '/^$/d' | sort -u || true)"
+
 INTERFACE_NAMES=()
 INTERFACE_IPS=()
-INTERFACE_LINES="$(echo "${SHOW_CONFIG_OUTPUT}" | sed -n 's/.*set interface "\([^"]*\)" ipv4-address "\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\)".*/\1 \2/p' | awk '!seen[$1]++' | grep -v '^vpnt' || true)"
-if [[ -n "$INTERFACE_LINES" ]]; then
-    while IFS=' ' read -r iface_name iface_ip; do
-        [[ -z "$iface_name" ]] && continue
-        INTERFACE_NAMES+=("$iface_name")
-        INTERFACE_IPS+=("$iface_ip")
-    done <<< "$INTERFACE_LINES"
-fi
+INTERFACE_NETWORKS=()
+
+# Capture each interface's IP and subnet mask independently (rather than
+# requiring both on the same line in a fixed order), then join them by
+# interface name - this is more robust to formatting differences in
+# "show configuration" output across appliance versions.
+declare -A IFACE_IP_BY_NAME
+declare -A IFACE_MASK_BY_NAME
+IFACE_ORDER=()
+
+while IFS=' ' read -r iface_name iface_ip; do
+    [[ -z "$iface_name" ]] && continue
+    if [[ -z "${IFACE_IP_BY_NAME[$iface_name]:-}" ]]; then
+        IFACE_ORDER+=("$iface_name")
+    fi
+    IFACE_IP_BY_NAME["$iface_name"]="$iface_ip"
+done <<< "$(echo "${SHOW_CONFIG_OUTPUT}" | sed -n 's/.*set interface "\([^"]*\)" ipv4-address "\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\)".*/\1 \2/p' | awk '!seen[$1]++' || true)"
+
+while IFS=' ' read -r iface_name iface_mask; do
+    [[ -z "$iface_name" ]] && continue
+    IFACE_MASK_BY_NAME["$iface_name"]="$iface_mask"
+done <<< "$(echo "${SHOW_CONFIG_OUTPUT}" | sed -n 's/.*set interface "\([^"]*\)".*subnet-mask "\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\)".*/\1 \2/p' | awk '!seen[$1]++' || true)"
+
+# Some interface types (notably VLAN sub-interfaces, e.g. "DMZ.10" for VLAN
+# 10 on interface DMZ) are configured with "mask-length" <prefix> instead of
+# "subnet-mask" <dotted-decimal>. Only fill this in for interfaces that
+# don't already have a subnet-mask captured above.
+while IFS=' ' read -r iface_name iface_prefix; do
+    [[ -z "$iface_name" ]] && continue
+    [[ -n "${IFACE_MASK_BY_NAME[$iface_name]:-}" ]] && continue
+    [[ "$iface_prefix" =~ ^[0-9]{1,2}$ ]] || continue
+    [ "$iface_prefix" -ge 0 ] && [ "$iface_prefix" -le 32 ] || continue
+    IFACE_MASK_BY_NAME["$iface_name"]="$(prefix_to_mask "$iface_prefix")"
+done <<< "$(echo "${SHOW_CONFIG_OUTPUT}" | sed -n 's/.*set interface "\([^"]*\)".*mask-length "\?\([0-9]\{1,2\}\)"\?.*/\1 \2/p' | awk '!seen[$1]++' || true)"
+
+for iface_name in "${IFACE_ORDER[@]}"; do
+    [[ "$iface_name" == vpnt* ]] && continue
+
+    if [[ -n "$INTERNET_IFACE_NAMES" ]] && grep -qx "$iface_name" <<< "$INTERNET_IFACE_NAMES"; then
+        log_msg "Excluding Internet/WAN-backed interface from advertisement list: ${iface_name}"
+        continue
+    fi
+    # Fallback: also exclude by name pattern, in case this system's
+    # "show configuration" doesn't expose the internet-connection
+    # binding in a form the parsing above can match.
+    if [[ "$iface_name" =~ ^[Ii]nternet[0-9]*$ || "$iface_name" =~ ^WAN[0-9]*$ ]]; then
+        log_msg "Excluding likely Internet/WAN interface by name pattern: ${iface_name}"
+        continue
+    fi
+
+    iface_ip="${IFACE_IP_BY_NAME[$iface_name]}"
+    iface_mask="${IFACE_MASK_BY_NAME[$iface_name]:-}"
+
+    INTERFACE_NAMES+=("$iface_name")
+    INTERFACE_IPS+=("$iface_ip")
+    if [[ -n "$iface_mask" ]] && is_valid_ipv4 "$iface_mask"; then
+        INTERFACE_NETWORKS+=("$(network_from_ip_and_mask "$iface_ip" "$iface_mask")")
+    else
+        # Couldn't determine the mask for this interface - fall back to
+        # showing the host IP rather than guessing at a network.
+        INTERFACE_NETWORKS+=("${iface_ip} (mask unknown)")
+    fi
+done
 
 echo "Select which local interface(s) should be advertised to the SASE gateway(s) over BGP:"
 for i in "${!INTERFACE_NAMES[@]}"; do
-    printf "  %d) %s - %s\n" "$((i + 1))" "${INTERFACE_NAMES[$i]}" "${INTERFACE_IPS[$i]}"
+    printf "  %d) %s - %s\n" "$((i + 1))" "${INTERFACE_NAMES[$i]}" "${INTERFACE_NETWORKS[$i]}"
 done
 ALL_IFACE_OPTION=$(( ${#INTERFACE_NAMES[@]} + 1 ))
 NETWORK_OPTION=$(( ${#INTERFACE_NAMES[@]} + 2 ))
@@ -1072,7 +1562,17 @@ while true; do
     ADV_INPUT="$(echo "$ADV_INPUT" | tr -d '[:space:]')"
 
     if [[ "$ADV_INPUT" == "$ALL_IFACE_OPTION" ]]; then
-        ADVERTISE_MODE="all"
+        if [ "${#INTERFACE_NAMES[@]}" -gt 0 ]; then
+            # "All" means all interfaces printed above - build the same
+            # per-interface redistribution as if every number had been
+            # selected, so excluded WAN/VTI interfaces are never included.
+            ADVERTISE_MODE="interfaces"
+            ADVERTISE_INTERFACES=("${INTERFACE_NAMES[@]}")
+        else
+            # No interfaces were discovered to enumerate individually - fall
+            # back to the blanket "from interface all" command as a last resort.
+            ADVERTISE_MODE="all"
+        fi
         break
     fi
 
@@ -1104,6 +1604,26 @@ while true; do
 done
 
 if [[ "$ADVERTISE_MODE" == "networks" ]]; then
+    # BGP "aggregate" redistribution requires the network to already exist
+    # as a pre-configured aggregate route ("set aggregate <prefix> ...") -
+    # Check Point will not create one on the fly, and will fail at
+    # execution time with "Unable to redistribute an Aggregate Route that
+    # is not already configured." Build the set of what's already
+    # configured so each entry can be validated up front instead.
+    EXISTING_AGGREGATES="$(echo "${ROUTER_CONFIG_OUTPUT}" | sed -n 's/.*set aggregate "\?\([0-9]\{1,3\}\(\.[0-9]\{1,3\}\)\{3\}\/[0-9]\{1,2\}\)"\?.*/\1/p' | sort -u || true)"
+
+    if [[ -z "$EXISTING_AGGREGATES" ]]; then
+        echo -e "${C_YELLOW}Warning: no pre-configured aggregate routes (\"set aggregate ...\") were found"
+        echo -e "on this system. BGP can only redistribute a network via \"aggregate\" if it has"
+        echo -e "already been configured as one - this script will not create it for you, since"
+        echo -e "that requires choices (contributing protocol, contributing route, etc.) only"
+        echo -e "you can make correctly for your topology.${C_RESET}"
+        echo -e "${C_YELLOW}Configure the aggregate route(s) first (see Check Point's \"Configuring Route"
+        echo -e "Aggregation\" guide), then re-run this script - or choose interface-based"
+        echo -e "advertisement instead.${C_RESET}"
+        echo
+    fi
+
     while true; do
         read -rp "Enter network(s) to advertise in CIDR format, comma separated (e.g. 10.0.0.0/24,192.168.1.0/24): " NET_INPUT
         IFS=',' read -ra NET_CHOICES <<< "$NET_INPUT"
@@ -1128,6 +1648,13 @@ if [[ "$ADVERTISE_MODE" == "networks" ]]; then
             fi
             if [ "$net_prefix" -lt 0 ] || [ "$net_prefix" -gt 32 ]; then
                 echo "Error: prefix \"/$net_prefix\" in \"$net_entry\" must be between /0 and /32. Please try again."
+                NET_VALID=false
+                break
+            fi
+            if [[ -z "$EXISTING_AGGREGATES" ]] || ! grep -qx "$net_entry" <<< "$EXISTING_AGGREGATES"; then
+                echo "Error: \"$net_entry\" is not configured as an aggregate route on this system yet (checked \"show router-configuration\")."
+                echo "  Configure it first with: set aggregate ${net_entry} contributing protocol <protocol> contributing-route all on"
+                echo "  Then re-run this script, or choose a different, already-configured network."
                 NET_VALID=false
                 break
             fi
@@ -1264,6 +1791,7 @@ MANIFEST_FILE="${LOG_DIR}/sase_vpn_manifest_${TIMESTAMP}.conf"
     echo "ACCESS_RULE_CREATED=$([[ "$ACCESS_RULE_EXISTS" == true ]] && echo false || echo true)"
     echo "GATEWAY_ID=${GATEWAY_ID}"
     ( IFS=','; echo "SITE_NAMES=${SITE_NAMES[*]}" )
+    ( IFS=','; echo "SASE_GW_IPS=${SASE_GW_IPS[*]}" )
     ( IFS=','; echo "VTI_IDS=${VTI_IDS[*]}" )
     ( IFS=','; echo "VTI_REMOTE_IPS=${VTI_REMOTE_IPS[*]}" )
     ( IFS=','; echo "HOST_OBJ_NAMES=${HOST_OBJ_NAMES[*]}" )
@@ -1476,3 +2004,28 @@ STEP_GROUPS+=("Enabling site-to-site VPN")
 # normal creation flow and the --revert flow.
 # ---------------------------------------------------------------------------
 execute_command_groups
+
+echo
+echo -e "${C_BOLD}Reminder - to undo this configuration later, run:${C_RESET}"
+echo -e "  $0 --revert \"${MANIFEST_FILE}\""
+
+# ---------------------------------------------------------------------------
+# Post-run health check. Tunnels and BGP peering take time to establish, so
+# this is offered as a separate, explicit step rather than being run
+# immediately - the user can check back once the estimated wait has passed.
+# See run_health_check_dashboard() for what the dashboard itself does.
+# ---------------------------------------------------------------------------
+echo
+echo -e "${C_BOLD}--- Configuration Health Check ---${C_RESET}"
+echo "It can take approximately 5 minutes for all tunnels and BGP peering to"
+echo "fully establish after this script completes. This check refreshes every"
+echo "10 seconds and stops automatically once everything is healthy."
+echo
+read -rp "Would you like to run a health check of the configuration now? (y/N): " HEALTHCHECK_CONFIRM
+if [[ ! "$HEALTHCHECK_CONFIRM" =~ ^[Yy]$ ]]; then
+    log_msg "User declined the post-run health check."
+    exit 0
+fi
+log_msg "User requested the post-run health check (live dashboard, 10s refresh)."
+
+run_health_check_dashboard
