@@ -16,3 +16,5 @@ The primary intended purpose right now is to help customers/partners in scriptin
 **SASEAttach**
 Meant to automate the process of connecting a locally managed spark appliance running R82.00.10 to one or multiple SASE gateways. Will setup full route based VPN configuration
 as recommended by Check Point admin guides instead of doing a simpler domain based approach.
+To copy this to a locally managed spark appliance and apply execute permissions, you can run this command that utilizes flags and binaries specific to spark functionality, thus
+avoiding SCP: curl_cli -k -L -O https://raw.githubusercontent.com/jsowder85/chkpshells/refs/heads/main/SASEAttach.sh;chmod +x SASEAttach.sh
