@@ -76,6 +76,65 @@
 #         gateway's public IP for this purpose). The rollback command
 #         reminder is now also reprinted immediately after execution
 #         completes, not just before, so it's harder to miss/scroll past.
+#   1.4 - Added a new "--auto \"ANSWER;ANSWER;...\"" flag that runs the
+#         entire normal creation flow non-interactively by feeding a
+#         single semicolon-separated answer string into stdin, in the
+#         same order prompts would normally appear. This does not bypass
+#         any validation or confirmation step - it only supplies the
+#         answers, so the exact same checks still apply. Also fixed the
+#         on-screen step count/summary to consistently report at the same
+#         high-level grouped level in both the creation and --revert flows
+#         (previously the summary could show a different, confusing total
+#         than the steps actually listed), and replaced a screen-clearing
+#         call in the health check dashboard with a plain separator so
+#         earlier configuration output is no longer wiped from view.
+#   1.5 - Full review pass over user input validation. Fixed: an extremely
+#         long numeric string (e.g. a mistyped AS number or gateway count)
+#         could trigger a confusing raw bash arithmetic error instead of a
+#         clean validation message; IPv4 addresses with leading zeros in an
+#         octet (e.g. "01.2.3.4") were incorrectly accepted, which is
+#         ambiguous across different parsers; the suggested default local
+#         VTI IP could come out identical to the remote VTI IP when the
+#         remote address ended in .0 or .255, causing the script's own
+#         suggested default to fail its own duplicate-IP check. Also added
+#         stronger validation of --revert/--healthcheck manifest files
+#         (consistent array lengths, a present/numeric policy ID) so a
+#         corrupted or hand-edited manifest fails with a clear message
+#         instead of a generic error. None of these required restarting
+#         the script - every fix re-prompts in place.
+#   1.6 - Added a "--help" / "-h" flag that lists every available flag
+#         (--auto, --revert, --healthcheck, --help) with a description of
+#         what each one does, checked before anything else so it works
+#         regardless of what other flags might otherwise be expected.
+#   1.7 - Added a check for whether the appliance is centrally managed -
+#         either 'set maas mode "enable"' (Smart-1 Cloud) or
+#         'set security-management mode centrally-managed' (an SMS or
+#         MDM) in the "show configuration" output - since this script
+#         does not support centrally-managed appliances. The
+#         configuration is now pulled, and this check run, as the very
+#         first thing in the main flow (before the gateway-count prompt
+#         or any other input), so a centrally-managed appliance is caught
+#         and the script exits immediately without asking anything else.
+#   1.8 - Made the centrally-managed detection tolerant of minor
+#         formatting differences (extra whitespace, optional quoting)
+#         instead of requiring an exact literal match, and added
+#         diagnostic logging of the captured configuration size plus a
+#         breadcrumb if "maas" or "centrally-managed" appears anywhere
+#         but doesn't match the expected pattern - to make it possible to
+#         pinpoint a mismatch from the log alone if this is ever reported
+#         not to trigger again.
+#   1.9 - The centrally-managed check still wasn't triggering on a real
+#         Smart-1 Cloud appliance even with the broadest possible search
+#         (case-insensitive "maas" with no other constraints), despite
+#         the line being confirmed present via the same clish command run
+#         manually. "show configuration" is now captured to a file FIRST,
+#         and the centrally-managed check runs directly against that file
+#         rather than a bash variable - command substitution can silently
+#         lose data (e.g. truncating at an embedded NUL byte, which
+#         Smart-1 Cloud connection data could plausibly contain) in ways
+#         a file write does not. The log now also records the file's line
+#         /byte count alongside the variable's, so a future mismatch
+#         between the two would be immediately visible as confirmation.
 # ---------------------------------------------------------------------------
 
 set -euo pipefail
@@ -566,6 +625,68 @@ bgp_peer_state() {
 
 log_msg "=== Run started ==="
 
+# ---------------------------------------------------------------------------
+# --help / -h
+#
+# Prints usage information and exits. Checked before anything else so it
+# works regardless of what other flags might otherwise be expected.
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    cat << HELPEOF
+${C_BOLD}SASE Route-Based VPN + BGP Configuration Script${C_RESET}
+
+Configures (and can later remove, or check the health of) a route-based
+site-to-site VPN with numbered VTIs and BGP peering between a Check Point
+Spark appliance and one or more SASE gateways.
+
+${C_BOLD}USAGE${C_RESET}
+  $0 [FLAG] [ARGUMENT]
+
+${C_BOLD}FLAGS${C_RESET}
+  (none)
+        Runs the normal interactive creation flow: prompts for every
+        setting needed (gateway count, BGP AS numbers, per-gateway public
+        IP/PSK/VTI addresses, Spark gateway IP, route advertisement, etc.),
+        shows a summary, and applies the configuration after confirmation.
+        Offers a live health check dashboard at the end.
+
+  --auto "ANSWER;ANSWER;..."
+        Runs the same normal creation flow non-interactively, by feeding a
+        single semicolon-separated string of answers into stdin in the
+        exact order prompts would normally appear. This does not skip any
+        validation or confirmation step - it only supplies the answers, so
+        every check still applies. Use a comma WITHIN one answer for
+        multi-value prompts (e.g. "1,2" for selecting multiple interfaces);
+        semicolons only separate one answer from the next. Leave an answer
+        blank (";;") to accept a default. Example:
+          $0 --auto "1;;;131.226.45.218;MySecretKey123;MySecretKey123;169.254.10.1;169.254.10.2;65.185.68.215;1;y;n"
+
+  --revert [manifest_file]
+        Undoes a previous run of this script. If no manifest path is
+        given, the most recent one found under /storage/sase_vpn (or the
+        fallback locations) is used automatically. Shows exactly what will
+        be removed/disabled before asking for confirmation.
+
+  --healthcheck [manifest_file]
+        Runs only the live health check dashboard (VPN tunnel and BGP peer
+        status, refreshed every 10 seconds) without repeating the creation
+        flow. Loads the same rollback manifest used by --revert to know
+        which tunnels/peers to check; auto-detects the most recent one if
+        no path is given.
+
+  --help, -h
+        Shows this help message and exits.
+
+${C_BOLD}NOTES${C_RESET}
+  - A log file and rollback manifest are written to /storage/sase_vpn (the
+    partition that survives a reboot on Spark appliances) every time the
+    creation flow is run and confirmed.
+  - This script is provided AS-IS for Proof of Value (PoV) demonstrations
+    and has been tested with Check Point Spark version R82.00.10.
+HELPEOF
+    exit 0
+fi
+
 BANNER_WIDTH=78
 echo -e "${C_RED}${C_BOLD}$(printf '=%.0s' $(seq 1 $BANNER_WIDTH))${C_RESET}"
 echo -e "${C_RED}${C_BOLD}  DISCLAIMER${C_RESET}"
@@ -623,6 +744,48 @@ log_msg "Displayed AS-IS / PoV-only disclaimer banner (tested with Spark R82.00.
 # Always left untouched (a shared/global setting unrelated to any single
 # run): the global "set vpn site-to-site mode" switch.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# --auto "ANSWER;ANSWER;ANSWER;..."
+#
+# Lets the entire normal creation flow run non-interactively by supplying
+# every prompt's answer up front, in a single string, semicolon-separated.
+# This does NOT bypass any validation, conditional prompts, or confirmation
+# steps - it simply feeds the given answers into stdin in order, exactly as
+# if they had been typed live, so every existing check still applies.
+#
+# Answers must be given in the SAME ORDER prompts would normally appear,
+# including any conditional ones that only show up depending on system
+# state or what was entered (e.g. a private-IP confirmation, an AS-mismatch
+# warning, or the tunnel-test compatibility warning) - if a run hits one of
+# these and no matching answer is left, that prompt will fail to read
+# input and the script will exit with an unexpected-error message. When in
+# doubt, run interactively once first on a similar system to see the exact
+# prompt sequence, then build the --auto string to match it.
+#
+# A comma is used WITHIN a single answer for multi-value prompts (e.g.
+# "1,2" for selecting multiple interfaces, or a comma-separated CIDR list) -
+# semicolons are only the separator BETWEEN answers.
+#
+# Example (1 gateway, defaults for local/SASE AS, "all interfaces", confirm
+# both the apply step and the health check offer):
+#   ./create_sase_vpn.sh --auto "1;;;131.226.45.218;MySecretKey123;MySecretKey123;169.254.10.1;169.254.10.2;65.185.68.215;1;y;y"
+# ---------------------------------------------------------------------------
+if [[ "${1:-}" == "--auto" ]]; then
+    AUTO_ANSWERS="${2:-}"
+    if [[ -z "$AUTO_ANSWERS" ]]; then
+        echo "Error: --auto requires an answer string. Example:"
+        echo "  $0 --auto \"1;;;131.226.45.218;MySecretKey123;MySecretKey123;169.254.10.1;169.254.10.2;65.185.68.215;1;y;y\""
+        exit 1
+    fi
+    log_msg "Running in --auto (non-interactive) mode."
+    # Feed the semicolon-separated answers into stdin, one per line, so the
+    # normal read-based prompts below consume them in order - this changes
+    # nothing about what gets validated or asked, only where the answers
+    # come from.
+    exec < <(printf '%s\n' "${AUTO_ANSWERS//;/$'\n'}")
+fi
+
 if [[ "${1:-}" == "--revert" ]]; then
     REVERT_MANIFEST="${2:-}"
 
@@ -661,6 +824,20 @@ if [[ "${1:-}" == "--revert" ]]; then
     if [[ -z "${SASE_AS:-}" || "${#R_SITE_NAMES[@]}" -eq 0 ]]; then
         echo -e "${C_RED}Error: manifest file is missing required data. Aborting.${C_RESET}"
         log_msg "FATAL: manifest file '${REVERT_MANIFEST}' is missing required fields."
+        exit 1
+    fi
+
+    if [[ -z "${NEXT_POLICY_ID:-}" || ! "${NEXT_POLICY_ID}" =~ ^[0-9]+$ ]]; then
+        echo -e "${C_RED}Error: manifest file is missing a valid inbound route filter policy ID."
+        echo -e "It may be corrupted, hand-edited, or from an incompatible version. Aborting.${C_RESET}"
+        log_msg "FATAL: manifest file '${REVERT_MANIFEST}' has an invalid or missing NEXT_POLICY_ID."
+        exit 1
+    fi
+
+    if [[ "${#R_SITE_NAMES[@]}" -ne "${#R_VTI_IDS[@]}" || "${#R_SITE_NAMES[@]}" -ne "${#R_VTI_REMOTE_IPS[@]}" ]]; then
+        echo -e "${C_RED}Error: manifest file has mismatched data (different numbers of site names,"
+        echo -e "VTI IDs, and VTI remote IPs). It may be corrupted or hand-edited. Aborting.${C_RESET}"
+        log_msg "FATAL: manifest file '${REVERT_MANIFEST}' has mismatched array lengths (sites=${#R_SITE_NAMES[@]}, vti_ids=${#R_VTI_IDS[@]}, vti_remote_ips=${#R_VTI_REMOTE_IPS[@]})."
         exit 1
     fi
 
@@ -876,6 +1053,14 @@ if [[ "${1:-}" == "--healthcheck" ]]; then
         exit 1
     fi
 
+    if [[ "$GW_COUNT" -ne "${#SASE_GW_IPS[@]}" || "$GW_COUNT" -ne "${#VTI_REMOTE_IPS[@]}" ]]; then
+        echo -e "${C_RED}Error: manifest file has mismatched data (different numbers of site names,"
+        echo -e "SASE gateway IPs, and VTI remote IPs). It may be corrupted or hand-edited.${C_RESET}"
+        echo -e "${C_RED}Aborting.${C_RESET}"
+        log_msg "FATAL: manifest file '${HEALTHCHECK_MANIFEST}' has mismatched array lengths (sites=${GW_COUNT}, gw_ips=${#SASE_GW_IPS[@]}, vti_remote_ips=${#VTI_REMOTE_IPS[@]})."
+        exit 1
+    fi
+
     echo "Monitoring the following tunnel(s):"
     for ((i = 0; i < GW_COUNT; i++)); do
         echo "  - ${SITE_NAMES[$i]}: gateway ${SASE_GW_IPS[$i]}, BGP peer ${VTI_REMOTE_IPS[$i]}"
@@ -890,6 +1075,66 @@ echo -e "${C_BOLD}=== SASE Route-Based VPN + BGP Configuration ===${C_RESET}"
 echo
 
 # ---------------------------------------------------------------------------
+# Pull the running configuration immediately, before any prompts, and check
+# right away for signs this appliance is centrally managed. This script is
+# not supported on a centrally-managed Spark appliance, so this must happen
+# before asking for anything else - not after the gateway count or any
+# other prompt.
+# ---------------------------------------------------------------------------
+echo "Retrieving current configuration (this may take a moment)..."
+log_msg "Retrieving current configuration (show configuration)..."
+
+# Captured to a file FIRST, and the centrally-managed check below runs
+# directly against that file - not a bash variable. Command substitution
+# (VAR="$(...)") silently truncates at the first NUL byte if one appears
+# anywhere in the output, which would make a real line simply vanish from
+# a bash variable's perspective while still being fully present on disk.
+# Smart-1 Cloud (MaaS) connection data can plausibly include such bytes,
+# so this check must not depend on data having survived that trip through
+# a variable.
+SHOW_CONFIG_FILE="$(mktemp)"
+clish -c "show configuration" > "$SHOW_CONFIG_FILE" 2>&1
+log_msg "show configuration captured to file: $(wc -l < "$SHOW_CONFIG_FILE") lines, $(wc -c < "$SHOW_CONFIG_FILE") bytes."
+
+CENTRAL_MGMT_TYPE=""
+if grep -qiE 'maas[[:space:]]+mode[[:space:]]+"?enable"?' "$SHOW_CONFIG_FILE"; then
+    CENTRAL_MGMT_TYPE="Smart-1 Cloud"
+elif grep -qiE 'security-management[[:space:]]+mode[[:space:]]+"?centrally-managed"?' "$SHOW_CONFIG_FILE"; then
+    CENTRAL_MGMT_TYPE="an SMS or MDM"
+fi
+
+# Diagnostic breadcrumb in case neither pattern matches on some system but
+# the word "maas" or "centrally-managed" still shows up somewhere - helps
+# pinpoint a formatting difference without needing to reproduce it live.
+if [[ -z "$CENTRAL_MGMT_TYPE" ]]; then
+    if grep -qi 'maas' "$SHOW_CONFIG_FILE"; then
+        log_msg "DIAGNOSTIC: 'maas' found in the show-configuration FILE but did not match the expected pattern: $(grep -i 'maas' "$SHOW_CONFIG_FILE")"
+    fi
+    if grep -qi 'centrally-managed' "$SHOW_CONFIG_FILE"; then
+        log_msg "DIAGNOSTIC: 'centrally-managed' found in the show-configuration FILE but did not match the expected pattern: $(grep -i 'centrally-managed' "$SHOW_CONFIG_FILE")"
+    fi
+fi
+
+if [[ -n "$CENTRAL_MGMT_TYPE" ]]; then
+    echo
+    echo -e "${C_RED}${C_BOLD}Error: this Spark appliance appears to be centrally managed.${C_RESET}"
+    echo -e "${C_RED}It looks like it is being managed by ${CENTRAL_MGMT_TYPE}. This script does"
+    echo -e "not support centrally-managed appliances and will now exit.${C_RESET}"
+    log_msg "FATAL: appliance appears centrally managed (${CENTRAL_MGMT_TYPE}). Exiting - not supported."
+    rm -f "$SHOW_CONFIG_FILE"
+    exit 1
+fi
+
+# Now populate the variable used by the rest of the script from the same
+# file. If this ever comes out a different size than the file above, that
+# confirms the variable itself is being truncated somewhere along the way.
+SHOW_CONFIG_OUTPUT="$(cat "$SHOW_CONFIG_FILE")"
+log_msg "show configuration in variable: $(echo "${SHOW_CONFIG_OUTPUT}" | wc -l) lines, $(echo "${SHOW_CONFIG_OUTPUT}" | wc -c) bytes (compare to the file-based count above - a mismatch indicates truncation)."
+rm -f "$SHOW_CONFIG_FILE"
+echo
+echo
+
+# ---------------------------------------------------------------------------
 # Helper: validate a dotted-decimal IPv4 address (each octet 0-255)
 # ---------------------------------------------------------------------------
 is_valid_ipv4() {
@@ -899,7 +1144,9 @@ is_valid_ipv4() {
     read -ra octets <<< "$ip"
     [ "${#octets[@]}" -eq 4 ] || return 1
     for o in "${octets[@]}"; do
-        [[ "$o" =~ ^[0-9]{1,3}$ ]] || return 1
+        # Reject leading zeros (e.g. "01") to avoid octal-parsing ambiguity -
+        # only a bare "0" or a number not starting with 0 is accepted.
+        [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
         [ "$o" -ge 0 ] && [ "$o" -le 255 ] || return 1
     done
     return 0
@@ -963,7 +1210,7 @@ network_from_ip_and_mask() {
 # ---------------------------------------------------------------------------
 is_valid_asn() {
     local val=$1
-    [[ "$val" =~ ^[0-9]+$ ]] || return 1
+    [[ "$val" =~ ^[0-9]{1,10}$ ]] || return 1
     [ "$val" -ge 1 ] && [ "$val" -le 4294967295 ] || return 1
     return 0
 }
@@ -1061,11 +1308,15 @@ suggest_local_vti() {
     local suggested
     if (( last % 2 == 1 )); then
         suggested=$((last + 1))
+        # If incrementing would go out of range (remote ends in .255),
+        # decrement instead - either way, this must never equal $last,
+        # or the suggested default would collide with the remote IP itself.
+        (( suggested > 255 )) && suggested=$((last - 1))
     else
         suggested=$((last - 1))
+        # Same idea for the low boundary (remote ends in .0).
+        (( suggested < 0 )) && suggested=$((last + 1))
     fi
-    (( suggested < 0 )) && suggested=0
-    (( suggested > 255 )) && suggested=255
     echo "${prefix}.${suggested}"
 }
 
@@ -1078,7 +1329,7 @@ suggest_local_vti() {
 MAX_GATEWAYS=50
 while true; do
     read -rp "How many SASE gateways would you like to establish tunnels to?: " GW_COUNT_INPUT
-    if [[ "$GW_COUNT_INPUT" =~ ^[0-9]+$ ]] && [ "$GW_COUNT_INPUT" -ge 1 ] && [ "$GW_COUNT_INPUT" -le "$MAX_GATEWAYS" ]; then
+    if [[ "$GW_COUNT_INPUT" =~ ^[0-9]{1,9}$ ]] && [ "$GW_COUNT_INPUT" -ge 1 ] && [ "$GW_COUNT_INPUT" -le "$MAX_GATEWAYS" ]; then
         GW_COUNT="$GW_COUNT_INPUT"
         break
     fi
@@ -1156,15 +1407,12 @@ if [[ -n "$EXISTING_LOCAL_AS" || -n "$EXISTING_REMOTE_AS_LIST" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Retrieve the running configuration once - used to auto-discover the
-# ike-v2-global-gateway-id, to avoid creating duplicate objects (access
-# rules, VPN sites, VTI tunnel IDs) on re-runs, and to detect IP addresses
-# already in use on this system so newly entered VTI IPs can be checked
-# for conflicts before they're applied.
+# The running configuration was already pulled (and checked for signs of
+# central management) right at the start, before any prompts - reused here
+# to auto-discover the ike-v2-global-gateway-id, avoid creating duplicate
+# objects (access rules, VPN sites, VTI tunnel IDs) on re-runs, and detect
+# IP addresses already in use on this system.
 # ---------------------------------------------------------------------------
-echo "Retrieving current configuration (this may take a moment)..."
-log_msg "Retrieving current configuration (show configuration)..."
-SHOW_CONFIG_OUTPUT="$(clish -c "show configuration")"
 
 # Look for a line such as:
 #   set vpn site-to-site mode "off" ... ike-v2-global-gateway-id "Gateway-ID-7FB70622"
@@ -1588,7 +1836,7 @@ while true; do
         ADV_VALID=false
     fi
     for choice in "${ADV_CHOICES[@]}"; do
-        if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#INTERFACE_NAMES[@]}" ]; then
+        if [[ ! "$choice" =~ ^[0-9]{1,9}$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#INTERFACE_NAMES[@]}" ]; then
             ADV_VALID=false
             break
         fi
